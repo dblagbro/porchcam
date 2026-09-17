@@ -28,6 +28,7 @@ import sys
 import warnings
 from pathlib import Path
 
+import cairo
 import gi
 
 gi.require_version("Gtk", "3.0")
@@ -56,6 +57,11 @@ MIN_W, MAX_W = 160, 1920
 MIN_OPACITY, MAX_OPACITY = 0.15, 1.0
 RESIZE_STEP = 1.10            # per wheel notch
 OPACITY_STEP = 0.05
+RENDER_WIDTH, RENDER_HEIGHT = 960, 540   # frames are decoded/scaled to this and
+                                         # then cairo-scaled to the window size
+BORDER_WIDTH = 2              # outline px; 0 disables. A night scene renders as
+                              # near-black, so without an outline there is no way
+                              # to tell the window is even on screen.
 RETRY_SECONDS = 3             # backoff before rebuilding a dead pipeline
 WATCHDOG_SECONDS = 6          # no new frames for this long => rebuild
 
@@ -66,6 +72,7 @@ class Overlay:
         self.pipeline = None
         self.bus = None
         self.video_widget = None
+        self.surface = None       # latest decoded frame, as a cairo surface
         self.frames = 0           # bumped by a pad probe on every frame
         self._last_seen = -1
         self._retry_id = None
@@ -162,6 +169,21 @@ class Overlay:
         )
         self.container.connect("button-press-event", self.on_button_press)
         self.container.connect("scroll-event", self.on_scroll)
+
+        # One persistent drawing area for the video. Nothing is swapped on a
+        # reconnect any more — only the pipeline behind it is rebuilt.
+        self.video_area = Gtk.DrawingArea()
+        self.video_area.set_app_paintable(True)
+        self.video_area.connect("draw", self._draw_video)
+        self.container.add(self.video_area)
+
+        if BORDER_WIDTH > 0:
+            # Draw the outline in the container's own draw handler, AFTER the
+            # default handler has painted the children. A GtkDrawingArea overlay
+            # child cannot be used here: it paints its theme background before
+            # the draw signal fires, which covers the video with opaque grey.
+            self.video_area.connect_after("draw", self._draw_border)
+
         self.window.add(self.container)
 
         self.window.add_events(
@@ -175,6 +197,21 @@ class Overlay:
         self.window.connect("scroll-event", self.on_scroll)
         self.window.connect("key-press-event", self.on_key)
         self.window.connect("realize", lambda *_: self.apply_opacity())
+
+    @staticmethod
+    def _draw_border(widget, cr):
+        """Two-tone outline: dark outside, light inside, so it stays visible
+        over both a black night scene and a bright daylight one."""
+        w = widget.get_allocated_width()
+        h = widget.get_allocated_height()
+        cr.set_line_width(1)
+        cr.set_source_rgba(0, 0, 0, 0.75)
+        cr.rectangle(0.5, 0.5, w - 1, h - 1)
+        cr.stroke()
+        cr.set_source_rgba(1, 1, 1, 0.65)
+        cr.rectangle(1.5, 1.5, w - 3, h - 3)
+        cr.stroke()
+        return False
 
     def _height_for(self, width):
         return max(1, int(round(width / ASPECT)))
@@ -288,47 +325,79 @@ class Overlay:
     # so a reconnect always means a brand-new pipeline.
 
     def _build_pipeline(self):
+        # gtksink renders nothing on this system (verified: SMPTE bars come out
+        # as a flat grey field), and gtkglsink fails to start at all. So frames
+        # are pulled from an appsink and painted with cairo instead. That also
+        # keeps rendering purely client-side, which is what lets the compositor
+        # blend the window — an X-overlay sink would punch through and ignore
+        # _NET_WM_WINDOW_OPACITY.
         desc = (
             f'rtspsrc name=src location="{RTSP_URL}" protocols=tcp latency=100 '
             "timeout=5000000 tcp-timeout=5000000 ! "
             "rtph264depay ! h264parse ! avdec_h264 ! "
             "videoconvert ! videoscale ! "
-            "gtksink name=sink force-aspect-ratio=true sync=false"
+            f"video/x-raw,format=BGRx,width={RENDER_WIDTH},height={RENDER_HEIGHT} ! "
+            "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false"
         )
         pipeline = Gst.parse_launch(desc)
         sink = pipeline.get_by_name("sink")
-
-        # Count frames so the watchdog can tell "connected" from "actually working".
-        pad = sink.get_static_pad("sink")
-        if pad is not None:
-            pad.add_probe(Gst.PadProbeType.BUFFER, self._on_frame)
+        sink.connect("new-sample", self._on_sample)
 
         bus = pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message::error", self._on_bus_problem)
         bus.connect("message::eos", self._on_bus_problem)
-        return pipeline, bus, sink.props.widget
+        return pipeline, bus, self.video_area
 
-    def _on_frame(self, _pad, _info):
+    def _on_sample(self, sink):
+        """Runs on a GStreamer streaming thread — copy out, then hand to GTK."""
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        ok, info = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.OK
+        try:
+            # cairo needs to own the pixels; the GStreamer buffer is recycled.
+            data = bytearray(info.data)
+        finally:
+            buf.unmap(info)
         self.frames += 1
-        return Gst.PadProbeReturn.OK
+        GLib.idle_add(self._push_frame, data, priority=GLib.PRIORITY_HIGH_IDLE)
+        return Gst.FlowReturn.OK
+
+    def _push_frame(self, data):
+        stride = cairo.ImageSurface.format_stride_for_width(
+            cairo.FORMAT_RGB24, RENDER_WIDTH
+        )
+        self.surface = cairo.ImageSurface.create_for_data(
+            data, cairo.FORMAT_RGB24, RENDER_WIDTH, RENDER_HEIGHT, stride
+        )
+        self.video_area.queue_draw()
+        return False
+
+    def _draw_video(self, widget, cr):
+        w = widget.get_allocated_width()
+        h = widget.get_allocated_height()
+        cr.set_source_rgb(0, 0, 0)
+        cr.paint()
+        surface = self.surface
+        if surface is None:
+            return False
+        cr.save()
+        cr.scale(w / RENDER_WIDTH, h / RENDER_HEIGHT)
+        cr.set_source_surface(surface, 0, 0)
+        cr.get_source().set_filter(cairo.FILTER_BILINEAR)
+        cr.paint()
+        cr.restore()
+        return False
 
     def start_stream(self):
         self._retry_id = None
         self.stop_stream(clear_widget=False)
 
-        self.pipeline, self.bus, widget = self._build_pipeline()
-
-        old = self.container.get_child()
-        if old is not None:
-            self.container.remove(old)
-        widget.set_hexpand(True)
-        widget.set_vexpand(True)
-        widget.set_can_focus(False)
-        self.container.add(widget)
-        widget.show()
-        self.video_widget = widget
-
+        self.pipeline, self.bus, self.video_widget = self._build_pipeline()
         self.pipeline.set_state(Gst.State.PLAYING)
 
         self._last_seen = self.frames
@@ -349,9 +418,6 @@ class Overlay:
             self.pipeline.set_state(Gst.State.NULL)
             self.pipeline = None
         if clear_widget:
-            child = self.container.get_child()
-            if child is not None:
-                self.container.remove(child)
             self.video_widget = None
 
     def restart_stream(self):
