@@ -1,0 +1,13 @@
+#!/bin/bash
+# porchcam-overlay-toggle — show the overlay if it is hidden, hide it if shown.
+# Only ever touches the overlay window; the capture service and the Blue Iris
+# feed are a separate process and are never affected.
+set -uo pipefail
+PATTERN='^python3 /usr/local/bin/porchcam-overlay$'
+
+if pgrep -f "$PATTERN" >/dev/null 2>&1; then
+    pkill -f "$PATTERN"
+    exit 0
+fi
+setsid /usr/local/bin/porchcam-overlay >/dev/null 2>&1 < /dev/null &
+exit 0

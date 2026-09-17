@@ -1,0 +1,59 @@
+#!/bin/bash
+# porchcam-status — one-screen health check for both cameras.
+set -uo pipefail
+
+API=http://127.0.0.1:9997/v3/paths/list
+hr() { printf '─%.0s' {1..54}; echo; }
+
+echo "── services ───────────────────────────────────────────"
+for s in mediamtx porchcam-capture deskcam-capture; do
+    printf '  %-20s %s / %s\n' "$s" \
+        "$(systemctl is-active $s 2>/dev/null)" \
+        "$(systemctl is-enabled $s 2>/dev/null)"
+done
+
+echo "── cameras ────────────────────────────────────────────"
+for pair in "porch:/etc/porchcam/capture.env" "desk:/etc/porchcam/deskcam.env"; do
+    name=${pair%%:*}; env=${pair#*:}
+    dev=$(sudo -n sed -n 's/^DEVICE=//p' "$env" 2>/dev/null | head -1)
+    if [[ -n $dev && -e $dev ]]; then
+        card=$(v4l2-ctl -d "$dev" --info 2>/dev/null | sed -n 's/^\s*Card type\s*:\s*//p')
+        printf '  %-6s %s\n' "$name" "${card:-unknown} -> $(readlink -f "$dev")"
+    else
+        printf '  %-6s %s\n' "$name" "device missing"
+    fi
+done
+
+echo "── virtual camera (video conferencing) ────────────────"
+if [[ -e /dev/video10 ]]; then
+    label=$(v4l2-ctl -d /dev/video10 --info 2>/dev/null | sed -n 's/^\s*Card type\s*:\s*//p')
+    size=$(v4l2-ctl -d /dev/video10 --list-formats-ext 2>/dev/null | sed -n 's/.*Size: Discrete //p' | head -1)
+    printf '  /dev/video10  %s  %s\n' "${label:-?}" "${size:-no format set}"
+else
+    echo "  /dev/video10  NOT PRESENT (v4l2loopback not loaded)"
+fi
+
+echo "── streams ────────────────────────────────────────────"
+sudo -n curl -sf "$API" 2>/dev/null | python3 -c "
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print('  RTSP API unreachable'); sys.exit()
+for p in d.get('items',[]):
+    tr=','.join(p.get('tracks') or []) or '-'
+    print(f\"  {p['name']:6} ready={str(p['ready']):5} readers={len(p.get('readers',[])):2} tracks={tr}\")
+    print(f\"         bytes in/out {p.get('bytesReceived',0):,} / {p.get('bytesSent',0):,}\")
+"
+
+echo "── overlay ────────────────────────────────────────────"
+if pgrep -f '^python3 /usr/local/bin/porchcam-overlay$' >/dev/null 2>&1; then
+    echo "  running (close with Escape, or: porchcam-overlay-toggle)"
+else
+    echo "  not running (start with: porchcam-overlay-toggle)"
+fi
+
+echo "── Blue Iris URLs ─────────────────────────────────────"
+# Report the address a LAN client would actually dial, rather than a baked-in one.
+LAN_IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+echo "  porch: rtsp://camreader:<password>@${LAN_IP:-<this-host>}:8554/porch"
+echo "  desk:  rtsp://camreader:<password>@${LAN_IP:-<this-host>}:8554/desk"
+echo "  password: sudo cat /etc/porchcam/rtsp-password"

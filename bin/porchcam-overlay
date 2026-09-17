@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""
+porchcam-overlay — a borderless, always-on-top, semi-transparent desktop preview
+of the porch camera.
+
+It reads the *already-published* RTSP stream from the local MediaMTX server, so
+it never touches /dev/video* itself.  That means this window can be opened and
+closed as often as you like without interrupting the feed going to Blue Iris,
+and Blue Iris being down has no effect on this window.
+
+Controls
+    drag with the left mouse button . move
+    mouse wheel .................... resize (aspect ratio locked)
+    Ctrl + mouse wheel ............. transparency
+    + / - .......................... resize
+    [ / ] .......................... transparency
+    r .............................. reset size/position/opacity
+    right click .................... small menu
+    Escape or Ctrl+Q ............... close
+
+Size, position and opacity are remembered in ~/.config/porchcam/overlay.json.
+"""
+
+import json
+import os
+import signal
+import sys
+import warnings
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gst", "1.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gst, Gtk  # noqa: E402
+
+# --- configuration -----------------------------------------------------------
+
+RTSP_URL = os.environ.get("PORCHCAM_URL", "rtsp://127.0.0.1:8554/porch")
+STATE_FILE = Path(
+    os.environ.get(
+        "PORCHCAM_STATE",
+        Path(GLib.get_user_config_dir()) / "porchcam" / "overlay.json",
+    )
+)
+
+ASPECT = 16.0 / 9.0
+# x/y default to None, meaning "top-left of the primary monitor, inset a little".
+# A hard-coded 60,60 is wrong on a multi-monitor desktop whose monitors do not
+# start at the origin — on a desktop whose top-left monitor begins at x=640, say,
+# 60,60 lands in dead space between monitors.
+DEFAULTS = {"width": 480, "x": None, "y": None, "opacity": 0.70}
+DEFAULT_INSET = 40
+MIN_W, MAX_W = 160, 1920
+MIN_OPACITY, MAX_OPACITY = 0.15, 1.0
+RESIZE_STEP = 1.10            # per wheel notch
+OPACITY_STEP = 0.05
+RETRY_SECONDS = 3             # backoff before rebuilding a dead pipeline
+WATCHDOG_SECONDS = 6          # no new frames for this long => rebuild
+
+
+class Overlay:
+    def __init__(self):
+        self.state = self._load_state()
+        self.pipeline = None
+        self.bus = None
+        self.video_widget = None
+        self.frames = 0           # bumped by a pad probe on every frame
+        self._last_seen = -1
+        self._retry_id = None
+        self._watchdog_id = None
+        Gst.init(None)
+        self._build_window()
+
+    # --- monitor geometry ----------------------------------------------------
+
+    @staticmethod
+    def _primary_origin():
+        """Top-left of the primary monitor's work area, inset a little."""
+        try:
+            display = Gdk.Display.get_default()
+            monitor = display.get_primary_monitor() or display.get_monitor(0)
+            area = monitor.get_workarea()
+            return area.x + DEFAULT_INSET, area.y + DEFAULT_INSET
+        except Exception:
+            return DEFAULT_INSET, DEFAULT_INSET
+
+    # --- persistence ---------------------------------------------------------
+
+    def _load_state(self):
+        state = dict(DEFAULTS)
+        try:
+            with STATE_FILE.open() as fh:
+                saved = json.load(fh)
+            for key in DEFAULTS:
+                if key in saved and isinstance(saved[key], (int, float)):
+                    state[key] = saved[key]
+        except (OSError, ValueError):
+            pass  # first run, or an unreadable/corrupt file — defaults are fine
+        state["width"] = int(min(MAX_W, max(MIN_W, state["width"])))
+        # Fill in any unset position from the primary monitor.
+        if state["x"] is None or state["y"] is None:
+            px, py = self._primary_origin()
+            state["x"] = px if state["x"] is None else state["x"]
+            state["y"] = py if state["y"] is None else state["y"]
+        state["opacity"] = min(MAX_OPACITY, max(MIN_OPACITY, float(state["opacity"])))
+        return state
+
+    def save_state(self):
+        try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            x, y = self.window.get_position()
+            w, _h = self.window.get_size()
+            payload = {
+                "width": int(w),
+                "x": int(x),
+                "y": int(y),
+                "opacity": round(float(self.state["opacity"]), 3),
+            }
+            tmp = STATE_FILE.with_suffix(".tmp")
+            with tmp.open("w") as fh:
+                json.dump(payload, fh, indent=2)
+            tmp.replace(STATE_FILE)
+        except OSError as exc:
+            print(f"porchcam-overlay: could not save state: {exc}", file=sys.stderr)
+
+    # --- window --------------------------------------------------------------
+
+    def _build_window(self):
+        self.window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        self.window.set_title("Porch camera")
+        self.window.set_decorated(False)          # borderless
+        self.window.set_keep_above(True)          # always on top
+        self.window.set_skip_taskbar_hint(True)
+        self.window.set_skip_pager_hint(True)
+        self.window.set_app_paintable(True)
+        self.window.set_resizable(True)
+
+        width = int(self.state["width"])
+        self.window.set_default_size(width, self._height_for(width))
+        self.window.move(int(self.state["x"]), int(self.state["y"]))
+
+        # Lock the aspect ratio at the window-manager level.
+        geom = Gdk.Geometry()
+        geom.min_aspect = ASPECT
+        geom.max_aspect = ASPECT
+        geom.min_width, geom.min_height = MIN_W, self._height_for(MIN_W)
+        geom.max_width, geom.max_height = MAX_W, self._height_for(MAX_W)
+        self.window.set_geometry_hints(
+            None,
+            geom,
+            Gdk.WindowHints.ASPECT | Gdk.WindowHints.MIN_SIZE | Gdk.WindowHints.MAX_SIZE,
+        )
+
+        # A black backdrop so a reconnect shows black rather than desktop garbage.
+        self.container = Gtk.EventBox()
+        self.container.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.SCROLL_MASK
+            | Gdk.EventMask.SMOOTH_SCROLL_MASK
+        )
+        self.container.connect("button-press-event", self.on_button_press)
+        self.container.connect("scroll-event", self.on_scroll)
+        self.window.add(self.container)
+
+        self.window.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.SCROLL_MASK
+            | Gdk.EventMask.SMOOTH_SCROLL_MASK
+            | Gdk.EventMask.KEY_PRESS_MASK
+        )
+        self.window.connect("destroy", lambda *_: self.quit())
+        self.window.connect("button-press-event", self.on_button_press)
+        self.window.connect("scroll-event", self.on_scroll)
+        self.window.connect("key-press-event", self.on_key)
+        self.window.connect("realize", lambda *_: self.apply_opacity())
+
+    def _height_for(self, width):
+        return max(1, int(round(width / ASPECT)))
+
+    # --- opacity -------------------------------------------------------------
+
+    def apply_opacity(self):
+        value = min(MAX_OPACITY, max(MIN_OPACITY, float(self.state["opacity"])))
+        self.state["opacity"] = value
+        # On X11 this sets _NET_WM_WINDOW_OPACITY on the toplevel, which makes the
+        # compositor blend the ENTIRE window, video included (verified with
+        # `xprop -id <id> _NET_WM_WINDOW_OPACITY`).  GTK3 marks it deprecated and
+        # offers no replacement, so the warning is silenced rather than the call
+        # avoided — widget-level alpha would not tint the video sink.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            self.window.set_opacity(value)
+
+    def nudge_opacity(self, delta):
+        self.state["opacity"] = min(
+            MAX_OPACITY, max(MIN_OPACITY, self.state["opacity"] + delta)
+        )
+        self.apply_opacity()
+
+    # --- size ----------------------------------------------------------------
+
+    def scale_by(self, factor):
+        width, _ = self.window.get_size()
+        new_w = min(MAX_W, max(MIN_W, int(round(width * factor))))
+        self.window.resize(new_w, self._height_for(new_w))
+
+    def reset(self):
+        px, py = self._primary_origin()
+        self.state.update(DEFAULTS)
+        self.state["x"], self.state["y"] = px, py
+        self.window.resize(DEFAULTS["width"], self._height_for(DEFAULTS["width"]))
+        self.window.move(px, py)
+        self.apply_opacity()
+
+    # --- input ---------------------------------------------------------------
+
+    def on_button_press(self, _widget, event):
+        if event.button == 1:
+            # Hand the drag to the window manager: smooth, and it snaps properly.
+            self.window.begin_move_drag(
+                event.button, int(event.x_root), int(event.y_root), event.time
+            )
+            return True
+        if event.button == 3:
+            self.menu(event)
+            return True
+        return False
+
+    def on_scroll(self, _widget, event):
+        ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+        if event.direction == Gdk.ScrollDirection.SMOOTH:
+            _ok, _dx, dy = event.get_scroll_deltas()
+            if dy == 0:
+                return True
+            up = dy < 0
+        elif event.direction == Gdk.ScrollDirection.UP:
+            up = True
+        elif event.direction == Gdk.ScrollDirection.DOWN:
+            up = False
+        else:
+            return False
+
+        if ctrl:
+            self.nudge_opacity(OPACITY_STEP if up else -OPACITY_STEP)
+        else:
+            self.scale_by(RESIZE_STEP if up else 1 / RESIZE_STEP)
+        return True
+
+    def on_key(self, _widget, event):
+        key = Gdk.keyval_name(event.keyval)
+        ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+        if key == "Escape" or (ctrl and key in ("q", "Q")):
+            self.quit()
+        elif key in ("plus", "equal", "KP_Add"):
+            self.scale_by(RESIZE_STEP)
+        elif key in ("minus", "KP_Subtract"):
+            self.scale_by(1 / RESIZE_STEP)
+        elif key == "bracketright":
+            self.nudge_opacity(OPACITY_STEP)
+        elif key == "bracketleft":
+            self.nudge_opacity(-OPACITY_STEP)
+        elif key in ("r", "R"):
+            self.reset()
+        else:
+            return False
+        return True
+
+    def menu(self, event):
+        menu = Gtk.Menu()
+        for label, action in (
+            ("Reconnect stream", lambda *_: self.restart_stream()),
+            ("Reset size / position", lambda *_: self.reset()),
+            ("Close overlay", lambda *_: self.quit()),
+        ):
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", action)
+            menu.append(item)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    # --- gstreamer -----------------------------------------------------------
+    #
+    # The pipeline is built fresh for every connection attempt.  Driving a dead
+    # rtspsrc from NULL back to PLAYING does not reliably re-establish the RTSP
+    # session — it reconnects at the protocol level but no frames ever arrive —
+    # so a reconnect always means a brand-new pipeline.
+
+    def _build_pipeline(self):
+        desc = (
+            f'rtspsrc name=src location="{RTSP_URL}" protocols=tcp latency=100 '
+            "timeout=5000000 tcp-timeout=5000000 ! "
+            "rtph264depay ! h264parse ! avdec_h264 ! "
+            "videoconvert ! videoscale ! "
+            "gtksink name=sink force-aspect-ratio=true sync=false"
+        )
+        pipeline = Gst.parse_launch(desc)
+        sink = pipeline.get_by_name("sink")
+
+        # Count frames so the watchdog can tell "connected" from "actually working".
+        pad = sink.get_static_pad("sink")
+        if pad is not None:
+            pad.add_probe(Gst.PadProbeType.BUFFER, self._on_frame)
+
+        bus = pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self._on_bus_problem)
+        bus.connect("message::eos", self._on_bus_problem)
+        return pipeline, bus, sink.props.widget
+
+    def _on_frame(self, _pad, _info):
+        self.frames += 1
+        return Gst.PadProbeReturn.OK
+
+    def start_stream(self):
+        self._retry_id = None
+        self.stop_stream(clear_widget=False)
+
+        self.pipeline, self.bus, widget = self._build_pipeline()
+
+        old = self.container.get_child()
+        if old is not None:
+            self.container.remove(old)
+        widget.set_hexpand(True)
+        widget.set_vexpand(True)
+        widget.set_can_focus(False)
+        self.container.add(widget)
+        widget.show()
+        self.video_widget = widget
+
+        self.pipeline.set_state(Gst.State.PLAYING)
+
+        self._last_seen = self.frames
+        if self._watchdog_id is None:
+            self._watchdog_id = GLib.timeout_add_seconds(
+                WATCHDOG_SECONDS, self._watchdog
+            )
+        return False  # so it can be used as a GLib timeout callback
+
+    def stop_stream(self, clear_widget=True):
+        if self.bus is not None:
+            try:
+                self.bus.remove_signal_watch()
+            except Exception:
+                pass
+            self.bus = None
+        if self.pipeline is not None:
+            self.pipeline.set_state(Gst.State.NULL)
+            self.pipeline = None
+        if clear_widget:
+            child = self.container.get_child()
+            if child is not None:
+                self.container.remove(child)
+            self.video_widget = None
+
+    def restart_stream(self):
+        if self._retry_id is not None:
+            return  # a reconnect is already pending
+        self.stop_stream(clear_widget=False)
+        self._retry_id = GLib.timeout_add_seconds(RETRY_SECONDS, self.start_stream)
+
+    def _on_bus_problem(self, _bus, message):
+        if message.type == Gst.MessageType.ERROR:
+            err, _dbg = message.parse_error()
+            print(f"porchcam-overlay: stream error: {err.message}", file=sys.stderr)
+        else:
+            print("porchcam-overlay: stream ended", file=sys.stderr)
+        self.restart_stream()
+
+    def _watchdog(self):
+        """Catch silent freezes: session alive at the protocol level, no frames."""
+        if self._retry_id is None:          # not already reconnecting
+            if self.frames == self._last_seen:
+                print(
+                    f"porchcam-overlay: no frames for {WATCHDOG_SECONDS}s — reconnecting",
+                    file=sys.stderr,
+                )
+                self.restart_stream()
+        self._last_seen = self.frames
+        return True  # keep the watchdog running
+
+    # --- lifecycle -----------------------------------------------------------
+
+    def run(self):
+        self.window.show_all()
+        self.apply_opacity()
+        # Mutter re-places undecorated windows at map time, overriding the move()
+        # made before show(), so the saved position is re-applied once the window
+        # is actually on screen.
+        GLib.idle_add(self._restore_position)
+        self.start_stream()
+        Gtk.main()
+
+    def _restore_position(self):
+        self.window.move(int(self.state["x"]), int(self.state["y"]))
+        return False
+
+    def quit(self, *_):
+        self.save_state()
+        if self._watchdog_id is not None:
+            GLib.source_remove(self._watchdog_id)
+            self._watchdog_id = None
+        if self._retry_id is not None:
+            GLib.source_remove(self._retry_id)
+            self._retry_id = None
+        self.stop_stream()
+        Gtk.main_quit()
+        return False
+
+
+def main():
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        print("porchcam-overlay: no graphical display available", file=sys.stderr)
+        return 1
+    overlay = Overlay()
+    # Ctrl-C / systemd stop should still save state and shut down cleanly.
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, overlay.quit)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, overlay.quit)
+    overlay.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

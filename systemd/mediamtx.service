@@ -1,0 +1,39 @@
+[Unit]
+Description=MediaMTX RTSP server (porchcam)
+Documentation=https://github.com/bluenviron/mediamtx
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mediamtx
+Group=mediamtx
+ExecStart=/opt/mediamtx/mediamtx /opt/mediamtx/mediamtx.yml
+Restart=always
+RestartSec=3
+WorkingDirectory=/opt/mediamtx
+
+# Bounded logging: journald caps these, and the rate limit stops a flapping
+# stream from filling the journal.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mediamtx
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/opt/mediamtx
+
+[Install]
+WantedBy=multi-user.target

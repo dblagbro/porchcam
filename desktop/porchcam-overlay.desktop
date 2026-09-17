@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Porch Camera Overlay
+GenericName=Camera overlay
+Comment=Borderless always-on-top preview of the porch camera
+Exec=/usr/local/bin/porchcam-overlay-toggle
+Icon=camera-web
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=camera;webcam;overlay;porch;security;
+StartupNotify=false

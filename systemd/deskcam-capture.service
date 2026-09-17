@@ -1,0 +1,38 @@
+[Unit]
+Description=deskcam capture (desk webcam -> local RTSP + virtual camera)
+After=mediamtx.service systemd-modules-load.service
+Wants=mediamtx.service
+# Never give up: if the camera is unplugged, the wrapper's readiness loop waits
+# for it to come back rather than the unit entering a failed state.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=porchcam
+Group=porchcam
+# video = the real camera and the loopback node; render = VAAPI on the Radeon.
+SupplementaryGroups=video render
+ExecStart=/usr/local/bin/deskcam-capture
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=deskcam-capture
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+DeviceAllow=char-video4linux rw
+DeviceAllow=char-drm rw
+
+[Install]
+WantedBy=multi-user.target

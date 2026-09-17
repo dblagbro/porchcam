@@ -1,0 +1,143 @@
+#!/bin/bash
+# deskcam-capture — open the desk (user-facing) webcam once and fan it out to:
+#   1. the local RTSP server, H.264 encoded, for Blue Iris
+#   2. a v4l2loopback virtual camera, for Zoom / Meet / Teams
+#
+# The physical camera is opened exactly once, here.  That is the whole point:
+# this camera has no hardware H.264, so it must be encoded, and it must ALSO stay
+# available to conferencing apps.  Both consumers read what this process produces
+# rather than competing for /dev/video0, which a webcam will not allow.
+#
+# Encoding is done on the Radeon via VAAPI, so the CPU cost stays near zero.
+set -uo pipefail
+
+CONF=/etc/porchcam/deskcam.env
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+
+DEVICE=${DEVICE:-/dev/v4l/by-id/usb-HDA_Webcam_USB_HDA_Webcam_USB_HDA_Webcam_USB-video-index0}
+WIDTH=${WIDTH:-1920}
+HEIGHT=${HEIGHT:-1080}
+FPS=${FPS:-30}
+INPUT_FORMAT=${INPUT_FORMAT:-mjpeg}
+RTSP_URL=${RTSP_URL:-rtsp://127.0.0.1:8554/desk}
+LOOPBACK=${LOOPBACK:-/dev/video10}
+CONF_WIDTH=${CONF_WIDTH:-1280}
+CONF_HEIGHT=${CONF_HEIGHT:-720}
+BITRATE=${BITRATE:-4M}
+VAAPI_DEVICE=${VAAPI_DEVICE:-/dev/dri/renderD128}
+API=${API:-http://127.0.0.1:9997/v3/config/global/get}
+READY_TIMEOUT=${READY_TIMEOUT:-30}
+PKT_SIZE=${PKT_SIZE:-1200}
+
+log() { printf '%s deskcam-capture: %s\n' "$(date -Is)" "$*"; }
+
+# --- Readiness: camera node --------------------------------------------------
+deadline=$((SECONDS + READY_TIMEOUT))
+until [[ -e $DEVICE ]]; do
+    (( SECONDS >= deadline )) && { log "FATAL: camera $DEVICE never appeared"; exit 1; }
+    sleep 0.5
+done
+log "camera $DEVICE -> $(readlink -f "$DEVICE")"
+
+# Identity check, so a USB re-enumeration can never stream the wrong camera.
+CARD=$(v4l2-ctl -d "$DEVICE" --info 2>/dev/null | sed -n 's/^\s*Card type\s*:\s*//p')
+log "card type: ${CARD:-unknown}"
+if [[ -n ${EXPECT_CARD:-} && $CARD != *"$EXPECT_CARD"* ]]; then
+    log "FATAL: expected card '$EXPECT_CARD' but found '$CARD' — refusing to stream"
+    exit 1
+fi
+
+# --- Readiness: virtual camera node ------------------------------------------
+deadline=$((SECONDS + READY_TIMEOUT))
+until [[ -e $LOOPBACK ]]; do
+    (( SECONDS >= deadline )) && { log "FATAL: loopback $LOOPBACK never appeared (is v4l2loopback loaded?)"; exit 1; }
+    sleep 0.5
+done
+log "virtual camera $LOOPBACK present"
+
+# --- Readiness: RTSP server ---------------------------------------------------
+deadline=$((SECONDS + READY_TIMEOUT))
+until curl -sf --max-time 2 "$API" >/dev/null 2>&1; do
+    (( SECONDS >= deadline )) && { log "FATAL: RTSP server not ready after ${READY_TIMEOUT}s"; exit 1; }
+    sleep 0.5
+done
+log "RTSP server ready"
+
+log "publishing ${WIDTH}x${HEIGHT}@${FPS} -> $RTSP_URL (h264_vaapi ${BITRATE}) + ${CONF_WIDTH}x${CONF_HEIGHT} -> $LOOPBACK"
+
+# --- Capture once, fan out twice ---------------------------------------------
+# split=2 duplicates the decoded frames: one branch is uploaded to the GPU and
+# encoded for Blue Iris, the other is scaled to a conferencing-friendly size and
+# written raw to the virtual camera.
+#: exit on a muxer/encoder error instead of lingering with a dead
+# output. Without it a restart of the RTSP server leaves this process alive
+# but no longer publishing, holding the camera open, and systemd's
+# Restart=always never fires because nothing ever exited.
+
+# --- Publish, with a readiness watchdog --------------------------------------
+# ffmpeg does NOT reliably exit when its RTSP output dies: if the server
+# restarts, it can sit there holding the camera with a broken output forever,
+# and because it never exits, systemd's Restart=always never fires.  (-xerror is
+# not the answer: it ignores that case and instead aborts on harmless
+# startup warnings like "Non-monotonic DTS".)
+#
+# So supervise it from outside: poll the server for this path's readiness and
+# exit non-zero if it stays down, which lets systemd restart us cleanly.
+PATH_NAME=${RTSP_URL##*/}
+PATHS_API=${PATHS_API:-http://127.0.0.1:9997/v3/paths/list}
+WATCHDOG_TIMEOUT=${WATCHDOG_TIMEOUT:-25}
+WATCHDOG_GRACE=${WATCHDOG_GRACE:-20}
+
+path_ready() {
+    curl -sf --max-time 3 "$PATHS_API" 2>/dev/null | PATH_NAME="$PATH_NAME" python3 -c "
+import json, os, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+want = os.environ['PATH_NAME']
+for p in d.get('items', []):
+    if p.get('name') == want:
+        sys.exit(0 if p.get('ready') else 1)
+sys.exit(1)
+"
+}
+
+FFPID=""
+cleanup() { [[ -n $FFPID ]] && kill -TERM "$FFPID" 2>/dev/null; }
+trap cleanup TERM INT EXIT
+
+ffmpeg -nostdin -hide_banner -loglevel warning \
+    -vaapi_device "$VAAPI_DEVICE" \
+    -use_wallclock_as_timestamps 1 \
+    -f v4l2 -input_format "$INPUT_FORMAT" \
+    -video_size "${WIDTH}x${HEIGHT}" -framerate "$FPS" \
+    -i "$DEVICE" \
+    -filter_complex "[0:v]format=nv12,hwupload,split=2[enc][loop];[loop]scale_vaapi=w=${CONF_WIDTH}:h=${CONF_HEIGHT},hwdownload,format=nv12,format=yuv420p[vloop]" \
+    -map "[enc]" -an -c:v h264_vaapi -b:v "$BITRATE" -g "$FPS" \
+    -pkt_size "$PKT_SIZE" -f rtsp -rtsp_transport tcp "$RTSP_URL" \
+    -map "[vloop]" -f v4l2 "$LOOPBACK" &
+FFPID=$!
+log "ffmpeg pid $FFPID; watchdog armed (path '$PATH_NAME', ${WATCHDOG_TIMEOUT}s tolerance)"
+
+sleep "$WATCHDOG_GRACE"   # let the first frames make it through before judging
+
+down=0
+while kill -0 "$FFPID" 2>/dev/null; do
+    if path_ready; then
+        down=0
+    else
+        down=$((down + 5))
+        if (( down >= WATCHDOG_TIMEOUT )); then
+            log "watchdog: path '$PATH_NAME' down ${down}s — exiting so systemd restarts us"
+            kill -TERM "$FFPID" 2>/dev/null; sleep 2; kill -KILL "$FFPID" 2>/dev/null
+            exit 1
+        fi
+    fi
+    sleep 5
+done
+
+wait "$FFPID"; rc=$?
+log "ffmpeg exited rc=$rc"
+exit "$rc"

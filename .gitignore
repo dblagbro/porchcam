@@ -1,0 +1,20 @@
+# Secrets — never commit these.
+rtsp-password
+*.password
+# The rendered config contains the RTSP password; only the template is tracked.
+mediamtx/mediamtx.yml
+mediamtx.yml.dist
+
+# Local backups of the deployed configuration (contain the password).
+backups/
+*.tar.gz
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor / OS noise
+*.swp
+*.swo
+*~
+.DS_Store

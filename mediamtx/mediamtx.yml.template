@@ -1,0 +1,51 @@
+###############################################
+# MediaMTX config for porchcam (C920 -> RTSP)
+# Managed file. Stock upstream config kept at
+# /opt/mediamtx/mediamtx.yml.dist
+###############################################
+
+logLevel: info
+logDestinations: [stdout]
+
+# --- API (localhost only) : used for readiness checks ---
+api: true
+apiAddress: 127.0.0.1:9997
+
+# --- RTSP : the only streaming protocol we expose ---
+rtsp: true
+rtspTransports: [tcp, udp]
+rtspAddress: :8554
+
+# --- everything else off: smaller attack surface ---
+rtmp: false
+hls: false
+webrtc: false
+srt: false
+moq: false
+
+# --- Access control (LAN only; no internet exposure) ---
+authMethod: internal
+authInternalUsers:
+  # Local publisher + local overlay playback, loopback only, no password.
+  - user: any
+    pass:
+    ips: ["127.0.0.1", "::1"]
+    permissions:
+      - action: publish
+      - action: read
+      - action: api
+      - action: metrics
+
+  # LAN reader account (used by Blue Iris and any other
+  # LAN viewer). Read-only, restricted to the local subnet.
+  - user: camreader
+    pass: @@RTSP_PASSWORD@@
+    ips: ["@@LAN_CIDR@@"]
+    permissions:
+      - action: read
+
+paths:
+  porch:
+    source: publisher
+  desk:
+    source: publisher
