@@ -56,4 +56,7 @@ echo "── Blue Iris URLs ─────────────────�
 LAN_IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
 echo "  porch: rtsp://camreader:<password>@${LAN_IP:-<this-host>}:8554/porch"
 echo "  desk:  rtsp://camreader:<password>@${LAN_IP:-<this-host>}:8554/desk"
+echo "  substreams (640x360, on demand — use as a Blue Iris sub-stream):"
+echo "    rtsp://camreader:<password>@${LAN_IP:-<this-host>}:8554/porch-sub"
+echo "    rtsp://camreader:<password>@${LAN_IP:-<this-host>}:8554/desk-sub"
 echo "  password: sudo cat /etc/porchcam/rtsp-password"

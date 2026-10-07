@@ -152,7 +152,7 @@ else
 fi
 
 say "done"
-echo "Blue Iris URL:  rtsp://camreader:<password>@$(hostname -I | tr ' ' '\n' | grep -E '^192\.168\.18\.' | head -1):8554/porch"
-echo "                rtsp://camreader:<password>@$(hostname -I | tr ' ' '\n' | grep -E '^192\.168\.18\.' | head -1):8554/desk"
+echo "Blue Iris URL:  rtsp://camreader:<password>@$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1):8554/porch"
+echo "                rtsp://camreader:<password>@$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1):8554/desk"
 echo "password:       sudo cat $PASSWORD_FILE"
 echo "health check:   porchcam-status"

@@ -1,0 +1,49 @@
+#!/bin/bash
+# deskcam-auto-reclaim [minutes] — after the desk cam is released (Ctrl+F9) to a VM,
+# watch for it to be IDLE (not captured by a VM, not opened by a host app) and
+# auto-reclaim it to the host once idle for [minutes] (default 20). Runs as the
+# desktop user (started by deskcam-release). Exits early if reclaimed manually.
+set -uo pipefail
+MIN=${1:-20}
+USB_ID=${DESK_USB_ID:-0c45:6366}
+CHECK=30
+IDLE_TARGET=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*60}')
+log() { printf '%s deskcam-auto-reclaim: %s\n' "$(date -Is)" "$*"; }
+notify() { command -v notify-send >/dev/null 2>&1 && notify-send -a "Desk cam" "$1" "$2" || true; }
+
+find_node() {  # echo the desk cam's /dev/video* node if present on the host
+    local v vid pid
+    for v in /dev/video*; do
+        [[ -e $v ]] || continue
+        vid=$(udevadm info "$v" 2>/dev/null | sed -n 's/^E: ID_VENDOR_ID=//p')
+        pid=$(udevadm info "$v" 2>/dev/null | sed -n 's/^E: ID_MODEL_ID=//p')
+        [[ "$vid:$pid" == "$USB_ID" ]] && { echo "$v"; return 0; }
+    done
+    return 1
+}
+in_use() {  # 0 = in use (VM has it, or a host process has it open); 1 = free/idle
+    local dev; dev=$(find_node) || return 0          # node gone -> captured by a VM
+    fuser "$dev" >/dev/null 2>&1 && return 0          # present but opened by a process
+    return 1
+}
+
+log "armed; will reclaim the desk cam after ${MIN} min idle (unused by VM/app)"
+idle=0
+while true; do
+    # someone manually reclaimed it — nothing to do
+    if systemctl is-active --quiet deskcam-capture; then
+        log "deskcam-capture already active — standing down"; exit 0
+    fi
+    if in_use; then
+        idle=0
+    else
+        idle=$((idle + CHECK))
+        if (( idle >= IDLE_TARGET )); then
+            log "idle ${MIN} min — auto-reclaiming desk cam to the host"
+            notify "Auto-reclaimed" "Desk cam was idle ${MIN} min — back on Blue Iris + overlay."
+            /usr/local/bin/deskcam-release        # stopped -> this reclaims (+ overlay)
+            exit 0
+        fi
+    fi
+    sleep "$CHECK"
+done

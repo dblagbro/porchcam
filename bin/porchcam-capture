@@ -24,12 +24,29 @@ DYNAMIC_FRAMERATE=${DYNAMIC_FRAMERATE:-0}
 log() { printf '%s porchcam-capture: %s\n' "$(date -Is)" "$*"; }
 
 # --- Readiness: wait for the camera node ------------------------------------
+# Prefer the stable /dev/v4l/by-id path; if it is absent (camera moved to a USB
+# port that enumerates a different node) fall back to finding the video-capture
+# node by USB vendor:product id (USB_ID) — fully port-independent.
+CONFIGURED_DEVICE="$DEVICE"
+resolve_device() {
+    [[ -n $CONFIGURED_DEVICE && -e $CONFIGURED_DEVICE ]] && { echo "$CONFIGURED_DEVICE"; return 0; }
+    [[ -z ${USB_ID:-} ]] && return 1
+    local v vid pid
+    for v in /dev/video*; do
+        [[ -e $v ]] || continue
+        v4l2-ctl -d "$v" --list-formats 2>/dev/null | grep -qE "'(YUYV|MJPG|H264|NV12)'" || continue
+        vid=$(udevadm info "$v" 2>/dev/null | sed -n 's/^E: ID_VENDOR_ID=//p')
+        pid=$(udevadm info "$v" 2>/dev/null | sed -n 's/^E: ID_MODEL_ID=//p')
+        [[ "$vid:$pid" == "$USB_ID" ]] && { echo "$v"; return 0; }
+    done
+    return 1
+}
 deadline=$((SECONDS + READY_TIMEOUT))
-until [[ -e $DEVICE ]]; do
-    (( SECONDS >= deadline )) && { log "FATAL: camera $DEVICE never appeared"; exit 1; }
+until DEVICE=$(resolve_device); do
+    (( SECONDS >= deadline )) && { log "FATAL: camera not found (by-id=$CONFIGURED_DEVICE USB_ID=${USB_ID:-unset})"; exit 1; }
     sleep 0.5
 done
-log "camera $DEVICE -> $(readlink -f "$DEVICE")"
+log "camera resolved: $DEVICE -> $(readlink -f "$DEVICE" 2>/dev/null || echo "$DEVICE")"
 
 # Confirm identity, so a USB re-enumeration can never silently stream the wrong camera.
 CARD=$(v4l2-ctl -d "$DEVICE" --info 2>/dev/null | sed -n 's/^\s*Card type\s*:\s*//p')
@@ -47,6 +64,12 @@ if v4l2-ctl -d "$DEVICE" --set-ctrl=exposure_dynamic_framerate="$DYNAMIC_FRAMERA
     log "exposure_dynamic_framerate=$DYNAMIC_FRAMERATE"
 else
     log "WARN: could not set exposure_dynamic_framerate (continuing)"
+fi
+
+# Optional image tuning (brightness/contrast/saturation; C920 has no gamma).
+# Set IMG_CTRLS in /etc/porchcam/capture.env, or live with: porchcam-image porch ...
+if [[ -n ${IMG_CTRLS:-} ]]; then
+    v4l2-ctl -d "$DEVICE" --set-ctrl="$IMG_CTRLS" 2>/dev/null         && log "image controls: $IMG_CTRLS" || log "WARN: could not apply IMG_CTRLS"
 fi
 
 # --- Readiness: wait for the RTSP server ------------------------------------
@@ -99,12 +122,29 @@ FFPID=""
 cleanup() { [[ -n $FFPID ]] && kill -TERM "$FFPID" 2>/dev/null; }
 trap cleanup TERM INT EXIT
 
+# The C920's onboard H.264 delivers no frame timestamps through v4l2 and uses a
+# fixed 300-frame (10s) GOP that is not reachable from V4L2 or any XU control the
+# kernel exposes. Both make downstream players stall. Capturing MJPEG and encoding
+# on the Radeon costs a little GPU but yields proper timestamps and a 1s GOP -
+# the same pattern deskcam already uses successfully.
+if [[ ${INPUT_FORMAT} == h264 ]]; then
+    VCODEC=(-an -c:v copy)
+    VFILTER=()
+    VAAPI=()
+else
+    VCODEC=(-an -c:v h264_vaapi -profile:v main -bf 0 -b:v "${BITRATE:-6M}" -g "$FPS")
+    VFILTER=(-vf format=nv12,hwupload)
+    VAAPI=(-vaapi_device "${VAAPI_DEVICE:-/dev/dri/renderD128}")
+fi
+
 ffmpeg -nostdin -hide_banner -loglevel warning \
+    "${VAAPI[@]}" \
     -use_wallclock_as_timestamps 1 \
     -f v4l2 -input_format "$INPUT_FORMAT" \
     -video_size "${WIDTH}x${HEIGHT}" -framerate "$FPS" \
     -i "$DEVICE" \
-    -an -c:v copy \
+    "${VFILTER[@]}" \
+    "${VCODEC[@]}" \
     -pkt_size "$PKT_SIZE" \
     -f rtsp -rtsp_transport tcp "$RTSP_URL" &
 FFPID=$!
@@ -120,7 +160,15 @@ while kill -0 "$FFPID" 2>/dev/null; do
         down=$((down + 5))
         if (( down >= WATCHDOG_TIMEOUT )); then
             log "watchdog: path '$PATH_NAME' down ${down}s — exiting so systemd restarts us"
-            kill -TERM "$FFPID" 2>/dev/null; sleep 2; kill -KILL "$FFPID" 2>/dev/null
+            # SIGTERM only, then wait for a CLEAN exit. Never SIGKILL: a hard
+            # kill leaves the v4l2loopback device without a negotiated format,
+            # and then NO future writer can attach to it until the module is
+            # reloaded — which would take the virtual camera down for good.
+            kill -TERM "$FFPID" 2>/dev/null
+            for _ in $(seq 1 30); do
+                kill -0 "$FFPID" 2>/dev/null || break
+                sleep 0.5
+            done
             exit 1
         fi
     fi

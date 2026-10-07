@@ -1,13 +1,27 @@
 #!/bin/bash
-# porchcam-overlay-toggle — show the overlay if it is hidden, hide it if shown.
-# Only ever touches the overlay window; the capture service and the Blue Iris
-# feed are a separate process and are never affected.
+# porchcam-overlay-toggle [porch|desk|all] — show/hide overlay windows.
+#   porch | desk : toggle that one overlay
+#   all          : hide BOTH if either is showing, else show both
+# Only ever touches overlay windows — the capture services and the feeds to
+# Blue Iris are never affected (handy for quickly hiding the cameras while
+# screen-sharing or presenting).
 set -uo pipefail
-PATTERN='^python3 /usr/local/bin/porchcam-overlay$'
 
-if pgrep -f "$PATTERN" >/dev/null 2>&1; then
-    pkill -f "$PATTERN"
-    exit 0
-fi
-setsid /usr/local/bin/porchcam-overlay >/dev/null 2>&1 < /dev/null &
+running() { pgrep -f "python3 /usr/local/bin/porchcam-overlay --instance $1" >/dev/null 2>&1; }
+start()   { setsid /usr/local/bin/porchcam-overlay --instance "$1" >/dev/null 2>&1 < /dev/null & }
+stop()    { pkill -f "python3 /usr/local/bin/porchcam-overlay --instance $1"; }
+
+case "${1:-porch}" in
+    all)
+        if running porch || running desk; then
+            running porch && stop porch; running desk && stop desk        # hide all
+        else
+            start porch; start desk                                       # show all
+        fi
+        ;;
+    porch|desk)
+        if running "$1"; then stop "$1"; else start "$1"; fi
+        ;;
+    *) echo "usage: porchcam-overlay-toggle [porch|desk|all]"; exit 1 ;;
+esac
 exit 0

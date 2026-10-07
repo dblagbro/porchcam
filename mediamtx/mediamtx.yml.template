@@ -36,8 +36,8 @@ authInternalUsers:
       - action: api
       - action: metrics
 
-  # LAN reader account (used by Blue Iris and any other
-  # LAN viewer). Read-only, restricted to the local subnet.
+  # LAN reader account (used by Blue Iris and any other LAN viewer).
+  # Read-only, restricted to the local subnet.
   - user: camreader
     pass: @@RTSP_PASSWORD@@
     ips: ["@@LAN_CIDR@@"]
@@ -49,3 +49,21 @@ paths:
     source: publisher
   desk:
     source: publisher
+  porch-sub:
+    # 640x360 substream for Blue Iris live view / motion detection.
+    # runOnDemand means this encoder starts only when something actually
+    # subscribes, and stops 30s after the last reader leaves — so it costs
+    # nothing while unused.
+    runOnDemand: ffmpeg -nostdin -hide_banner -loglevel warning -vaapi_device /dev/dri/renderD128 -rtsp_transport tcp -i rtsp://127.0.0.1:8554/porch -vf format=nv12,hwupload,scale_vaapi=w=640:h=360 -c:v h264_vaapi -b:v 600k -g 30 -an -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/porch-sub
+    runOnDemandRestart: yes
+    runOnDemandStartTimeout: 15s
+    runOnDemandCloseAfter: 30s
+  desk-sub:
+    # 640x360 substream for Blue Iris live view / motion detection.
+    # runOnDemand means this encoder starts only when something actually
+    # subscribes, and stops 30s after the last reader leaves — so it costs
+    # nothing while unused.
+    runOnDemand: ffmpeg -nostdin -hide_banner -loglevel warning -vaapi_device /dev/dri/renderD128 -rtsp_transport tcp -i rtsp://127.0.0.1:8554/desk -vf format=nv12,hwupload,scale_vaapi=w=640:h=360 -c:v h264_vaapi -b:v 600k -g 30 -an -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/desk-sub
+    runOnDemandRestart: yes
+    runOnDemandStartTimeout: 15s
+    runOnDemandCloseAfter: 30s

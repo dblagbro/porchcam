@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly camera encoder reset at 05:48
+
+[Timer]
+OnCalendar=*-*-* 05:48:00
+Persistent=false
+RandomizedDelaySec=0
+
+[Install]
+WantedBy=timers.target

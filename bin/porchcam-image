@@ -1,0 +1,37 @@
+#!/bin/bash
+# porchcam-image <porch|desk> [ctrl=value ...] — read or set camera image
+# controls (brightness, contrast, gamma, saturation, sharpness, ...).
+#
+#   porchcam-image desk                      # list current controls
+#   porchcam-image desk brightness=10 gamma=140
+#   porchcam-image porch contrast=150 brightness=140
+#
+# Changes apply LIVE to the running capture (so Blue Iris, the overlay, and — for
+# the desk cam — video calls all see them immediately). To make them survive a
+# capture restart, also set them in /etc/porchcam/<cam>.env (see IMG_CTRLS there).
+set -uo pipefail
+CAM="${1:-}"; shift || true
+case "$CAM" in
+  porch) DEV=/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_XXXXXXXX-video-index0 ;;
+  desk)  DEV=/dev/v4l/by-id/usb-HDA_Webcam_USB_HDA_Webcam_USB_HDA_Webcam_USB-video-index0 ;;
+  *) echo "usage: porchcam-image <porch|desk> [ctrl=value ...]"; exit 1 ;;
+esac
+[[ -e $DEV ]] || { echo "camera $CAM ($DEV) not present"; exit 1; }
+
+if [[ $# -eq 0 ]]; then
+    echo "== $CAM image controls ($DEV) =="
+    v4l2-ctl -d "$DEV" --list-ctrls | grep -iE \
+      "brightness|contrast|gamma|saturation|sharpness|hue|backlight|white_balance_temp"
+    echo
+    echo "set e.g.: porchcam-image $CAM brightness=10 contrast=40 gamma=140"
+    exit 0
+fi
+
+CTRLS=""
+for kv in "$@"; do CTRLS+="${CTRLS:+,}$kv"; done
+if v4l2-ctl -d "$DEV" --set-ctrl="$CTRLS"; then
+    echo "$CAM: applied $CTRLS"
+    v4l2-ctl -d "$DEV" --get-ctrl="$(echo "$CTRLS" | sed 's/=[^,]*//g')"
+else
+    echo "failed to apply: $CTRLS" >&2; exit 1
+fi

@@ -2,7 +2,7 @@
 Type=Application
 Name=Porch Camera Overlay
 Comment=Start the porch camera overlay when the desktop session begins
-Exec=/usr/local/bin/porchcam-overlay
+Exec=/usr/local/bin/porchcam-overlay --instance porch
 Icon=camera-web
 Terminal=false
 X-GNOME-Autostart-enabled=true

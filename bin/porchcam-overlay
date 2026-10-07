@@ -38,18 +38,33 @@ from gi.repository import Gdk, GLib, Gst, Gtk  # noqa: E402
 
 # --- configuration -----------------------------------------------------------
 
-RTSP_URL = os.environ.get("PORCHCAM_URL", "rtsp://127.0.0.1:8554/porch")
+# One overlay process per camera. `--instance desk` (or PORCHCAM_INSTANCE=desk)
+# selects the stream, the window title, and the saved-state file in one go; the
+# individual PORCHCAM_URL / PORCHCAM_TITLE / PORCHCAM_STATE env vars still
+# override any single piece. Default is the porch camera, unchanged.
+_INSTANCES = {
+    "porch": ("rtsp://127.0.0.1:8554/porch", "Porch camera", "overlay.json"),
+    "desk":  ("rtsp://127.0.0.1:8554/desk",  "Desk camera",  "overlay-desk.json"),
+}
+_inst = os.environ.get("PORCHCAM_INSTANCE", "porch")
+for _i, _a in enumerate(sys.argv):
+    if _a == "--instance" and _i + 1 < len(sys.argv):
+        _inst = sys.argv[_i + 1]
+_url_def, _title_def, _state_def = _INSTANCES.get(_inst, _INSTANCES["porch"])
+
+RTSP_URL = os.environ.get("PORCHCAM_URL", _url_def)
+WINDOW_TITLE = os.environ.get("PORCHCAM_TITLE", _title_def)
 STATE_FILE = Path(
     os.environ.get(
         "PORCHCAM_STATE",
-        Path(GLib.get_user_config_dir()) / "porchcam" / "overlay.json",
+        Path(GLib.get_user_config_dir()) / "porchcam" / _state_def,
     )
 )
 
 ASPECT = 16.0 / 9.0
 # x/y default to None, meaning "top-left of the primary monitor, inset a little".
 # A hard-coded 60,60 is wrong on a multi-monitor desktop whose monitors do not
-# start at the origin — on a desktop whose top-left monitor begins at x=640, say,
+# start at the origin — this workstation's top-left monitor begins at x=640, so
 # 60,60 lands in dead space between monitors.
 DEFAULTS = {"width": 480, "x": None, "y": None, "opacity": 0.70}
 DEFAULT_INSET = 40
@@ -136,7 +151,7 @@ class Overlay:
 
     def _build_window(self):
         self.window = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
-        self.window.set_title("Porch camera")
+        self.window.set_title(WINDOW_TITLE)
         self.window.set_decorated(False)          # borderless
         self.window.set_keep_above(True)          # always on top
         self.window.set_skip_taskbar_hint(True)

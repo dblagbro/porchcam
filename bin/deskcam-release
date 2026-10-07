@@ -1,0 +1,38 @@
+#!/bin/bash
+# deskcam-release — toggle the desk USB camera between the host and a VM.
+#
+#   RELEASE : stop deskcam-capture so the physical camera (Microdia 0c45:6366)
+#             is free for VirtualBox USB passthrough into a guest (video calls).
+#   RECLAIM : start it again so Blue Iris + the desk overlay + the virtual cam
+#             get the feed back.
+#
+# Bound to Ctrl+F9. Does NOT touch the porch camera or any other service.
+set -uo pipefail
+DESK_USB="Microdia Vitade AF (0c45:6366)"
+notify() { command -v notify-send >/dev/null 2>&1 && notify-send -a "Desk cam" "$1" "$2" || true; }
+
+if systemctl is-active --quiet deskcam-capture; then
+    # ---- RELEASE to the VM ----
+    for p in $(pgrep -f "porchcam-overlay --instance desk" 2>/dev/null); do
+        [[ "$(ps -o comm= -p "$p" 2>/dev/null)" == python3 ]] && kill "$p" 2>/dev/null
+    done
+    sudo -n systemctl stop deskcam-capture
+    sudo -n systemctl reset-failed deskcam-capture 2>/dev/null || true
+    notify "Released to VM" "Desk cam is free. In VirtualBox: Devices → USB → $DESK_USB.  Auto-reclaims after 20 min idle, or press Ctrl+F9."
+    pkill -f "/usr/local/bin/deskcam-auto-reclaim" 2>/dev/null || true
+    setsid /usr/local/bin/deskcam-auto-reclaim "${AUTO_RECLAIM_MIN:-20}" >/dev/null 2>&1 < /dev/null &
+    echo "deskcam-release: RELEASED — desk cam free for VM passthrough (auto-reclaim armed)"
+else
+    # ---- RECLAIM to the host ----
+    pkill -f "/usr/local/bin/deskcam-auto-reclaim" 2>/dev/null || true   # cancel the auto-reclaim watcher
+    sudo -n systemctl start deskcam-capture
+    sleep 3
+    if systemctl is-active --quiet deskcam-capture; then
+        setsid /usr/local/bin/porchcam-overlay --instance desk >/dev/null 2>&1 < /dev/null &
+        notify "Reclaimed by host" "Desk cam is back on Blue Iris + overlay."
+        echo "deskcam-release: RECLAIMED — desk cam back on the host"
+    else
+        notify "Could not reclaim" "The camera may still be captured by the VM. Detach it in VirtualBox (Devices → USB), then press Ctrl+F9 again."
+        echo "deskcam-release: reclaim failed — camera likely still held by the VM"
+    fi
+fi

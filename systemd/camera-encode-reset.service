@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly reset of camera capture (clears Radeon VAAPI encoder corruption)
+After=mediamtx.service
+
+[Service]
+Type=oneshot
+# Restart both capture services: tears down and re-inits the VAAPI encode sessions,
+# clearing the grey/pink corruption the encoder occasionally wedges into.
+ExecStart=/usr/bin/systemctl restart porchcam-capture.service deskcam-capture.service

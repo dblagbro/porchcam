@@ -1,0 +1,20 @@
+#!/bin/bash
+# porchcam-hotkey-setup — (re)bind the camera hotkeys. Run in your GNOME/X11 session.
+#   Ctrl+Alt+C : toggle both overlays on/off
+#   Ctrl+F9    : release the desk cam to a VM / reclaim it to the host
+set -uo pipefail
+KEY=org.gnome.settings-daemon.plugins.media-keys
+BASE=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings
+
+bind() {  # <slug> <name> <command> <binding>
+    local mine="$BASE/$1/" existing; existing=$(gsettings get $KEY custom-keybindings)
+    if [[ "$existing" != *"$1"* ]]; then
+        if [[ "$existing" == "@as []" || "$existing" == "[]" ]]; then n="['$mine']"; else n="${existing%]*}, '$mine']"; fi
+        gsettings set $KEY custom-keybindings "$n"
+    fi
+    local s="$KEY.custom-keybinding:$mine"
+    gsettings set "$s" name "$2"; gsettings set "$s" command "$3"; gsettings set "$s" binding "$4"
+    echo "  $4 -> $3"
+}
+bind porchcam-overlays "Toggle camera overlays"        "/usr/local/bin/porchcam-overlay-toggle all" "<Control><Alt>c"
+bind deskcam-release   "Release/reclaim desk cam for VM" "/usr/local/bin/deskcam-release"            "<Control>F9"

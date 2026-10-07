@@ -112,12 +112,32 @@ Chrome and Zoom to list it). Config lives in
 `/etc/modprobe.d/porchcam-v4l2loopback.conf`; changing options needs a reboot or
 `modprobe -r v4l2loopback`.
 
+### Releasing the physical camera to a VM
+
+Some setups need the *physical* desk camera inside a virtual machine
+(VirtualBox USB passthrough) rather than the virtual webcam. `deskcam-release`
+toggles it: the first run stops `deskcam-capture` so the USB device is free to
+attach to the guest, the second run reclaims it to the host (Blue Iris + overlay
++ virtual cam).
+
+If you forget to reclaim it, it **auto-reclaims after 20 minutes idle**
+(`deskcam-auto-reclaim`, armed automatically on release). "Idle" means the camera
+is neither captured by a VM (its `/dev/video*` node is gone) nor opened by a host
+app (checked with `fuser`), so a release stays in effect for as long as a meeting
+actually uses the camera and then heals itself afterward.
+
+Run `porchcam-hotkey-setup` once to bind this to **Ctrl+F9**, and overlay
+show/hide (below) to **Ctrl+Alt+C**, as GNOME custom shortcuts.
+
 ---
 
 ## Desktop overlay
 
 Start/stop with `porchcam-overlay-toggle`, or the **Porch Camera Overlay** menu
-entry. Starts automatically at login.
+entry. Starts automatically at login. The toggle takes an optional argument —
+`porchcam-overlay-toggle porch|desk|all` — to control one overlay or both at
+once; `porchcam-hotkey-setup` binds the `all` form to **Ctrl+Alt+C** for quickly
+hiding both cameras while screen-sharing (the feeds to Blue Iris are unaffected).
 
 | Control | Action |
 |---|---|
@@ -164,6 +184,23 @@ Disable without uninstalling:
 ```bash
 sudo systemctl disable --now porchcam-capture deskcam-capture mediamtx
 rm ~/.config/autostart/porchcam-overlay.desktop
+```
+
+### Self-healing (optional)
+
+Hardware VAAPI encoders can occasionally wedge into corrupted output (grey/pink
+blocks) while the stream still "flows", so a plain liveness check never notices.
+Two optional units ship for this and are **not enabled by default**:
+
+```bash
+# Decode a few frames per minute per camera; restart a capture that has
+# gone corrupt (installed by the wildcard, just enable it):
+sudo systemctl enable --now camera-corruption-monitor
+
+# Pre-emptive nightly restart of both captures (copy the timer in first,
+# then enable it):
+sudo install -m 0644 systemd/camera-encode-reset.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now camera-encode-reset.timer
 ```
 
 ---

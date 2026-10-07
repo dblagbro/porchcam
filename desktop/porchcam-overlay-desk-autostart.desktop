@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Desk Camera Overlay
+Comment=Start the desk (self) camera overlay when the desktop session begins
+Exec=/usr/local/bin/porchcam-overlay --instance desk
+Icon=camera-web
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=9
+StartupNotify=false

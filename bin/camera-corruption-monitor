@@ -1,0 +1,53 @@
+#!/bin/bash
+# camera-corruption-monitor — watch the VAAPI-encoded camera streams for H.264
+# decode corruption (the Radeon encoder occasionally wedges to grey/pink while the
+# stream still "flows", so the capture watchdog never sees it) and restart the
+# affected capture service to clear it. Runs as a systemd service (root).
+set -uo pipefail
+
+INTERVAL=${INTERVAL:-60}        # seconds between checks
+FRAMES=${FRAMES:-20}            # frames to decode per check
+THRESHOLD=${THRESHOLD:-6}       # decode errors in FRAMES frames that count as corrupt
+COOLDOWN=${COOLDOWN:-180}       # min seconds between restarts of the same camera
+API=${API:-http://127.0.0.1:9997/v3/paths/list}
+RTSP=${RTSP:-rtsp://127.0.0.1:8554}
+
+# path -> capture service
+declare -A SVC=( [porch]=porchcam-capture.service [desk]=deskcam-capture.service )
+declare -A LAST=()
+
+log() { printf '%s camera-corruption-monitor: %s\n' "$(date -Is)" "$*"; }
+
+path_online() {  # <path> -> 0 if the mediamtx path exists and is ready
+    curl -sf --max-time 3 "$API" 2>/dev/null | PN="$1" python3 -c "
+import json,os,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+w=os.environ['PN']
+for p in d.get('items',[]):
+    if p.get('name')==w: sys.exit(0 if p.get('ready') else 1)
+sys.exit(1)"
+}
+
+decode_errors() {  # <path> -> count of H.264 decode errors in FRAMES frames
+    timeout 25 ffmpeg -hide_banner -rtsp_transport tcp -i "$RTSP/$1" \
+        -frames:v "$FRAMES" -f null - 2>&1 \
+        | grep -icE "top block|left block|error while decoding|concealing|non-existing (PPS|SPS)|decode_slice_header error"
+}
+
+log "started (interval=${INTERVAL}s frames=${FRAMES} threshold=${THRESHOLD} cooldown=${COOLDOWN}s)"
+while true; do
+    sleep "$INTERVAL"
+    for path in porch desk; do
+        path_online "$path" || continue            # skip if not streaming (restart/release in progress)
+        errs=$(decode_errors "$path")
+        (( errs >= THRESHOLD )) || continue
+        now=$(date +%s); last=${LAST[$path]:-0}
+        if (( now - last < COOLDOWN )); then
+            log "/$path still corrupt ($errs/$FRAMES) but within ${COOLDOWN}s cooldown — waiting"
+            continue
+        fi
+        log "CORRUPTION on /$path ($errs/$FRAMES decode errors) — restarting ${SVC[$path]}"
+        systemctl restart "${SVC[$path]}" && LAST[$path]=$now
+    done
+done

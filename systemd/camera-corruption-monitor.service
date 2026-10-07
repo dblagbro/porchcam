@@ -1,0 +1,17 @@
+[Unit]
+Description=Camera stream corruption monitor (auto-recovers Radeon VAAPI glitches)
+After=mediamtx.service porchcam-capture.service deskcam-capture.service
+Wants=mediamtx.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/camera-corruption-monitor
+Restart=always
+RestartSec=10
+Nice=15
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
