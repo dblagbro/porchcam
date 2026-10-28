@@ -66,6 +66,17 @@ sudo ./uninstall.sh --purge-packages   # also removes packages added for this
 
 ---
 
+## Configuration
+
+Cameras are configured either by editing the per-camera `/etc/porchcam/*.env`
+files directly, or through a single declarative `/etc/porchcam/porchcam.yaml`
+managed with `porchcam-config` (`render` writes the `.env` files the services
+read; `import` builds the YAML from existing `.env` files). See
+[docs/CONFIG.md](docs/CONFIG.md). A config UI and an optional AI-assisted setup
+are on the [roadmap](docs/ROADMAP.md).
+
+---
+
 ## Blue Iris
 
 ```

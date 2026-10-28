@@ -1,0 +1,38 @@
+version: 1
+rtsp_base: rtsp://127.0.0.1:8554
+cameras:
+- name: porch
+  service: porchcam-capture
+  env_file: capture.env
+  device: /dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_XXXXXXXX-video-index0
+  expect_card: C920
+  width: 1920
+  height: 1080
+  fps: 30
+  input_format: mjpeg
+  rtsp_path: /porch
+  pkt_size: 1200
+  dynamic_framerate: true
+  img_ctrls: brightness=176,backlight_compensation=1
+  bitrate: 6M
+  vaapi_device: /dev/dri/renderD128
+  usb_id: 046d:082d
+- name: desk
+  service: deskcam-capture
+  env_file: deskcam.env
+  device: /dev/v4l/by-id/usb-HDA_Webcam_USB_HDA_Webcam_USB_HDA_Webcam_USB-video-index0
+  expect_card: HDA Webcam USB
+  width: 1920
+  height: 1080
+  fps: 20
+  input_format: mjpeg
+  rtsp_path: /desk
+  virtual_cam:
+    loopback: /dev/video10
+    width: 1280
+    height: 720
+  bitrate: 4M
+  vaapi_device: /dev/dri/renderD128
+  pkt_size: 1200
+  img_ctrls: brightness=8,gamma=130,contrast=36,saturation=64
+  usb_id: 0c45:6366
