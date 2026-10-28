@@ -146,13 +146,30 @@ hiding both cameras while screen-sharing (the feeds to Blue Iris are unaffected)
 | **Ctrl** + mouse wheel | Transparency |
 | `+` / `-` | Resize |
 | `[` / `]` | Transparency |
-| `r` | Reset |
-| Right click | Menu (reconnect / reset / close) |
+| `r` | Reset size / position |
+| Right click | Menu: **Adjust image…** / reconnect / reset / close |
 | `Esc` or `Ctrl+Q` | Close |
 
 Defaults to 480×270 at 70% opacity, top-left of the **primary** monitor.
-Size, position and opacity persist in `~/.config/porchcam/overlay.json`; delete
-it to return to defaults.
+Size, position, opacity **and image adjustments** persist per camera in
+`~/.config/porchcam/<instance>.json` (`overlay.json` for the first camera,
+`overlay-desk.json` for the second); delete it to return to defaults.
+
+### Adjust image
+
+Right-click → **Adjust image…** opens a small always-on-top panel of live
+sliders:
+
+| Slider | Effect |
+|---|---|
+| Translucency | window opacity (same as `Ctrl`+wheel) |
+| Brightness / Contrast / Colour / Hue | `videobalance` on the decoded frames |
+| Noise filter | one slider: right = blur out noise (useful for a camera shooting through a window screen's mesh/moiré), centre = off, left = sharpen (`gaussianblur` sigma) |
+
+Changes apply instantly, are saved when the panel closes, and reload on the
+next launch. **They affect this overlay's view only — not the recorded stream**
+(the adjustments live in the overlay's own decode pipeline). A "Reset
+adjustments" button restores the image defaults without moving the window.
 
 Transparency is genuine window-wide transparency — the compositor blends the
 whole window, video included (`_NET_WM_WINDOW_OPACITY`), not merely a

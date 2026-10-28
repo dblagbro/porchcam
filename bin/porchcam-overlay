@@ -15,10 +15,15 @@ Controls
     + / - .......................... resize
     [ / ] .......................... transparency
     r .............................. reset size/position/opacity
-    right click .................... small menu
+    right click .................... menu: Adjust image / reconnect / reset / close
     Escape or Ctrl+Q ............... close
 
-Size, position and opacity are remembered in ~/.config/porchcam/overlay.json.
+"Adjust image…" opens a small live panel for translucency, brightness, contrast,
+colour (saturation), hue and a noise filter. These are applied in this window's
+own decode pipeline only — they do NOT change the stream Blue Iris records.
+
+Size, position, opacity and image adjustments are remembered per camera in
+~/.config/porchcam/<instance>.json.
 """
 
 import json
@@ -66,10 +71,26 @@ ASPECT = 16.0 / 9.0
 # A hard-coded 60,60 is wrong on a multi-monitor desktop whose monitors do not
 # start at the origin — this workstation's top-left monitor begins at x=640, so
 # 60,60 lands in dead space between monitors.
-DEFAULTS = {"width": 480, "x": None, "y": None, "opacity": 0.70}
+DEFAULTS = {
+    "width": 480, "x": None, "y": None, "opacity": 0.70,
+    # Live image adjustments, applied in this window's own decode pipeline only
+    # (view-only — they do NOT change the stream Blue Iris records). The first
+    # four drive a `videobalance` element; `blur` drives `gaussianblur` (sigma:
+    # >0 blurs out noise, <0 sharpens, 0 is off).
+    "brightness": 0.0, "contrast": 1.0, "saturation": 1.0, "hue": 0.0, "blur": 0.0,
+}
 DEFAULT_INSET = 40
 MIN_W, MAX_W = 160, 1920
 MIN_OPACITY, MAX_OPACITY = 0.15, 1.0
+
+# key -> (label, min, max, step) for the Adjust panel's sliders.
+ADJUSTMENTS = (
+    ("brightness", "Brightness",          -1.0, 1.0, 0.02),
+    ("contrast",   "Contrast",             0.0, 2.0, 0.02),
+    ("saturation", "Colour (saturation)",  0.0, 2.0, 0.02),
+    ("hue",        "Hue",                 -1.0, 1.0, 0.02),
+    ("blur",       "Noise filter (blur ↔ sharpen)", -4.0, 8.0, 0.1),
+)
 RESIZE_STEP = 1.10            # per wheel notch
 OPACITY_STEP = 0.05
 RENDER_WIDTH, RENDER_HEIGHT = 960, 540   # frames are decoded/scaled to this and
@@ -92,6 +113,10 @@ class Overlay:
         self._last_seen = -1
         self._retry_id = None
         self._watchdog_id = None
+        self.balance = None        # videobalance element (brightness/contrast/…)
+        self.blur = None           # gaussianblur element (noise filter)
+        self.adjust_win = None     # the live "Adjust image" panel, if open
+        self._adjust_scales = {}
         Gst.init(None)
         self._build_window()
 
@@ -127,6 +152,11 @@ class Overlay:
             state["x"] = px if state["x"] is None else state["x"]
             state["y"] = py if state["y"] is None else state["y"]
         state["opacity"] = min(MAX_OPACITY, max(MIN_OPACITY, float(state["opacity"])))
+        for key, _label, lo, hi, _step in ADJUSTMENTS:
+            try:
+                state[key] = min(hi, max(lo, float(state[key])))
+            except (TypeError, ValueError):
+                state[key] = DEFAULTS[key]
         return state
 
     def save_state(self):
@@ -140,6 +170,8 @@ class Overlay:
                 "y": int(y),
                 "opacity": round(float(self.state["opacity"]), 3),
             }
+            for key, _l, _lo, _hi, _s in ADJUSTMENTS:
+                payload[key] = round(float(self.state[key]), 3)
             tmp = STATE_FILE.with_suffix(".tmp")
             with tmp.open("w") as fh:
                 json.dump(payload, fh, indent=2)
@@ -251,6 +283,29 @@ class Overlay:
         )
         self.apply_opacity()
 
+    # --- image adjustments (videobalance + gaussianblur) ---------------------
+
+    def apply_adjustments(self):
+        """Push the saved brightness/contrast/saturation/hue/blur onto the live
+        pipeline. Safe to call before the pipeline exists (it is re-applied on
+        every (re)build) and whenever a slider moves."""
+        if self.balance is not None:
+            for prop in ("brightness", "contrast", "saturation", "hue"):
+                try:
+                    self.balance.set_property(prop, float(self.state[prop]))
+                except Exception:
+                    pass
+        if self.blur is not None:
+            try:
+                self.blur.set_property("sigma", float(self.state["blur"]))
+            except Exception:
+                pass
+
+    def reset_adjustments(self):
+        for key, _l, _lo, _hi, _s in ADJUSTMENTS:
+            self.state[key] = DEFAULTS[key]
+        self.apply_adjustments()
+
     # --- size ----------------------------------------------------------------
 
     def scale_by(self, factor):
@@ -259,8 +314,11 @@ class Overlay:
         self.window.resize(new_w, self._height_for(new_w))
 
     def reset(self):
+        # Reset geometry + opacity only; image adjustments have their own reset
+        # in the Adjust panel so re-centring the window never wipes colour tuning.
         px, py = self._primary_origin()
-        self.state.update(DEFAULTS)
+        self.state["width"] = DEFAULTS["width"]
+        self.state["opacity"] = DEFAULTS["opacity"]
         self.state["x"], self.state["y"] = px, py
         self.window.resize(DEFAULTS["width"], self._height_for(DEFAULTS["width"]))
         self.window.move(px, py)
@@ -321,16 +379,96 @@ class Overlay:
 
     def menu(self, event):
         menu = Gtk.Menu()
-        for label, action in (
+        items = (
+            ("Adjust image…", lambda *_: self.open_adjust_dialog()),
+            (None, None),
             ("Reconnect stream", lambda *_: self.restart_stream()),
             ("Reset size / position", lambda *_: self.reset()),
             ("Close overlay", lambda *_: self.quit()),
-        ):
+        )
+        for label, action in items:
+            if label is None:
+                menu.append(Gtk.SeparatorMenuItem())
+                continue
             item = Gtk.MenuItem(label=label)
             item.connect("activate", action)
             menu.append(item)
         menu.show_all()
         menu.popup_at_pointer(event)
+
+    def open_adjust_dialog(self):
+        """A small, non-modal, always-on-top panel of live sliders. Changes apply
+        immediately to this window's pipeline and are saved when the panel closes."""
+        if self.adjust_win is not None:
+            self.adjust_win.present()
+            return
+
+        win = Gtk.Window(title=f"Adjust — {WINDOW_TITLE}")
+        win.set_keep_above(True)
+        win.set_resizable(False)
+        win.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        try:
+            win.set_transient_for(self.window)
+        except Exception:
+            pass
+
+        grid = Gtk.Grid(row_spacing=6, column_spacing=10)
+        grid.set_margin_top(12)
+        grid.set_margin_bottom(12)
+        grid.set_margin_start(12)
+        grid.set_margin_end(12)
+        self._adjust_scales = {}
+
+        def add_row(row, key, label, lo, hi, step, setter):
+            lbl = Gtk.Label(label=label, xalign=0.0)
+            scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
+            scale.set_digits(2)
+            scale.set_value(float(self.state[key]))
+            scale.set_size_request(240, -1)
+            scale.set_draw_value(True)
+            scale.set_value_pos(Gtk.PositionType.RIGHT)
+            scale.connect("value-changed", lambda s: setter(s.get_value()))
+            grid.attach(lbl, 0, row, 1, 1)
+            grid.attach(scale, 1, row, 1, 1)
+            self._adjust_scales[key] = scale
+
+        row = 0
+        add_row(row, "opacity", "Translucency", MIN_OPACITY, MAX_OPACITY, OPACITY_STEP,
+                lambda v: (self.state.__setitem__("opacity", v), self.apply_opacity()))
+        row += 1
+        for key, label, lo, hi, step in ADJUSTMENTS:
+            add_row(row, key, label, lo, hi, step,
+                    (lambda v, k=key: (self.state.__setitem__(k, v),
+                                       self.apply_adjustments())))
+            row += 1
+
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btns.set_margin_top(6)
+        reset_btn = Gtk.Button(label="Reset adjustments")
+        reset_btn.connect("clicked", lambda *_: self._dialog_reset())
+        close_btn = Gtk.Button(label="Close")
+        close_btn.connect("clicked", lambda *_: win.destroy())
+        btns.pack_start(reset_btn, False, False, 0)
+        btns.pack_end(close_btn, False, False, 0)
+        grid.attach(btns, 0, row, 2, 1)
+
+        win.add(grid)
+
+        def on_destroy(*_):
+            self.save_state()
+            self.adjust_win = None
+            self._adjust_scales = {}
+        win.connect("destroy", on_destroy)
+        self.adjust_win = win
+        win.show_all()
+
+    def _dialog_reset(self):
+        """Reset translucency + image adjustments to defaults, sliders included."""
+        self.state["opacity"] = DEFAULTS["opacity"]
+        self.apply_opacity()
+        self.reset_adjustments()
+        for key, scale in self._adjust_scales.items():
+            scale.set_value(float(DEFAULTS.get(key, self.state.get(key, 0.0))))
 
     # --- gstreamer -----------------------------------------------------------
     #
@@ -350,6 +488,9 @@ class Overlay:
             f'rtspsrc name=src location="{RTSP_URL}" protocols=tcp latency=100 '
             "timeout=5000000 tcp-timeout=5000000 ! "
             "rtph264depay ! h264parse ! avdec_h264 ! "
+            # videobalance = brightness/contrast/saturation/hue; gaussianblur =
+            # the noise filter. Both are live-tunable from the Adjust panel.
+            "videoconvert ! videobalance name=balance ! gaussianblur name=blur ! "
             "videoconvert ! videoscale ! "
             f"video/x-raw,format=BGRx,width={RENDER_WIDTH},height={RENDER_HEIGHT} ! "
             "appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false"
@@ -357,6 +498,12 @@ class Overlay:
         pipeline = Gst.parse_launch(desc)
         sink = pipeline.get_by_name("sink")
         sink.connect("new-sample", self._on_sample)
+
+        # Grab the processing elements and apply the saved adjustments. The
+        # pipeline is rebuilt on every reconnect, so this re-binds them each time.
+        self.balance = pipeline.get_by_name("balance")
+        self.blur = pipeline.get_by_name("blur")
+        self.apply_adjustments()
 
         bus = pipeline.get_bus()
         bus.add_signal_watch()
