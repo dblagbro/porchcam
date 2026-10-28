@@ -92,13 +92,18 @@ Productize exactly the workflow used to add the Amcrest this session.
 
 ---
 
-## Cross-cutting decisions (need input)
+## Cross-cutting decisions
+Resolved:
+- **License — MIT** (added; chosen for broad reuse).
+- **Config UI — local web UI**; **AI setup — Claude tool-use auto-discovery**.
+- **mediamtx — fetched in `postinst`** (not vendored; too large/arch-specific).
+
+Still open:
 1. **Project name** — "porchcam" is historical. A product name (e.g. *camstack*)
    may fit a distributable package. Affects package name, paths, service names.
-2. **License** — the public repo currently has none; a license is required before
-   distributing a package. (MIT / Apache-2.0 / GPL-3.0?)
-3. **Distro targets** — Ubuntu 24.04 only, or broader Debian/derivatives?
-4. **mediamtx** — vendor the binary in the package, or depend on / fetch it?
+2. **Distro targets** — Ubuntu 24.04 only, or broader Debian/derivatives?
+3. **Binary path** — `/usr/local/bin` today (matches current scripts); move to
+   `/usr/bin` with path-agnostic lookup for a policy-clean package (Phase 1 F/U).
 
 ## Suggested build order
 Phase 0 (schema) → Phase 1a (`nfpm` .deb) → Phase 2 (web UI CRUD + stream test) →
