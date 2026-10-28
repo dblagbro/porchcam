@@ -29,6 +29,19 @@ scripts, the UI, and the AI all read/write:
   the YAML, never inlined — keeps them out of backups-in-the-clear and AI prompts.
 
 ## Phase 1 — Debian packaging (`apt-get`)
+
+**Status: in progress.** A working `.deb` builds from `packaging/` with `nfpm`
+(`packaging/build-deb.sh`): all binaries, systemd units, `/etc/porchcam`
+conffiles, the mediamtx template, desktop files, docs and a changelog, with
+`postinst`/`prerm`/`postrm` ported from `install.sh`/`uninstall.sh` (create
+service users, fetch mediamtx, render `mediamtx.yml`, enable units) and the
+right dependency list. Built and verified by inspection (not installed on the
+dev host — it would collide with the `install.sh` deployment; real install-test
+belongs on a clean VM). Follow-ups: **(1)** move binaries from `/usr/local/bin`
+to `/usr/bin` with path-agnostic sibling lookup (removes the only lintian
+errors) — a coordinated change across scripts + units + `install.sh`; **(2)**
+install-test on a clean Ubuntu VM; **(3)** publish a Launchpad PPA.
+
 Options:
 - **(a) `nfpm`** — build a `.deb` (and `.rpm`) from the existing file layout with a
   short YAML spec. No debhelper learning curve. **Recommended first step.**

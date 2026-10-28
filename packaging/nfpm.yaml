@@ -1,0 +1,108 @@
+# nfpm spec for the porchcam .deb.  Build with: packaging/build-deb.sh
+# (run from the repo root).  Produces dist/porchcam_<version>_amd64.deb.
+#
+# Note: binaries install to /usr/local/bin to match the paths the scripts and
+# systemd units reference internally; a later cleanup can move to /usr/bin with
+# path-agnostic lookups. Config lives in /etc/porchcam as dpkg conffiles.
+name: porchcam
+arch: amd64
+platform: linux
+version: ${PORCHCAM_VERSION}
+version_schema: none
+section: video
+priority: optional
+maintainer: dblagbro <noreply@users.noreply.github.com>
+homepage: https://github.com/dblagbro/porchcam
+license: MIT
+description: |
+  Two or more cameras to an NVR, desktop overlays, and a virtual webcam.
+  Publishes each USB or IP camera once over RTSP (via mediamtx), re-encoding on
+  the GPU (VAAPI) where useful, and fans it out to a network video recorder
+  (e.g. Blue Iris), a transparent always-on-top desktop overlay with live
+  image adjustment, and a v4l2loopback virtual camera for video calls.
+
+depends:
+  - ffmpeg
+  - gstreamer1.0-plugins-good
+  - gstreamer1.0-plugins-bad
+  - gstreamer1.0-libav
+  - v4l-utils
+  - python3
+  - python3-gi
+  - python3-yaml
+  - curl
+recommends:
+  - v4l2loopback-dkms
+suggests:
+  - xdotool
+
+contents:
+  # --- executables (dir glob -> /usr/local/bin) ---
+  - src: ./bin/
+    dst: /usr/local/bin/
+    file_info: { mode: 0755 }
+
+  # --- systemd units ---
+  - src: ./systemd/camera-corruption-monitor.service
+    dst: /lib/systemd/system/camera-corruption-monitor.service
+  - src: ./systemd/camera-encode-reset.service
+    dst: /lib/systemd/system/camera-encode-reset.service
+  - src: ./systemd/camera-encode-reset.timer
+    dst: /lib/systemd/system/camera-encode-reset.timer
+  - src: ./systemd/deskcam-capture.service
+    dst: /lib/systemd/system/deskcam-capture.service
+  - src: ./systemd/mediamtx.service
+    dst: /lib/systemd/system/mediamtx.service
+  - src: ./systemd/porchcam-capture.service
+    dst: /lib/systemd/system/porchcam-capture.service
+  - src: ./systemd/porchcam-capture.service.d/vaapi.conf
+    dst: /lib/systemd/system/porchcam-capture.service.d/vaapi.conf
+
+  # --- kernel module config ---
+  - src: ./etc/modprobe.d/porchcam-v4l2loopback.conf
+    dst: /etc/modprobe.d/porchcam-v4l2loopback.conf
+    type: config
+  - src: ./etc/modules-load.d/porchcam-v4l2loopback.conf
+    dst: /etc/modules-load.d/porchcam-v4l2loopback.conf
+    type: config
+
+  # --- camera config (conffiles: dpkg keeps local edits on upgrade) ---
+  - src: ./etc/porchcam/capture.env
+    dst: /etc/porchcam/capture.env
+    type: "config|noreplace"
+  - src: ./etc/porchcam/deskcam.env
+    dst: /etc/porchcam/deskcam.env
+    type: "config|noreplace"
+  - src: ./etc/porchcam/porchcam.yaml
+    dst: /etc/porchcam/porchcam.yaml
+    type: "config|noreplace"
+
+  # --- mediamtx config template (postinst renders /opt/mediamtx/mediamtx.yml) ---
+  - src: ./mediamtx/mediamtx.yml.template
+    dst: /usr/share/porchcam/mediamtx.yml.template
+
+  # --- desktop integration ---
+  - src: ./desktop/porchcam-overlay.desktop
+    dst: /usr/share/applications/porchcam-overlay.desktop
+  - src: ./desktop/porchcam-overlay-autostart.desktop
+    dst: /usr/share/porchcam/autostart/porchcam-overlay-autostart.desktop
+  - src: ./desktop/porchcam-overlay-desk-autostart.desktop
+    dst: /usr/share/porchcam/autostart/porchcam-overlay-desk-autostart.desktop
+
+  # --- docs ---
+  - src: ./README.md
+    dst: /usr/share/doc/porchcam/README.md
+  - src: ./LICENSE
+    dst: /usr/share/doc/porchcam/copyright
+  - src: ./docs/CONFIG.md
+    dst: /usr/share/doc/porchcam/CONFIG.md
+  - src: ./docs/ROADMAP.md
+    dst: /usr/share/doc/porchcam/ROADMAP.md
+  - src: ./build/changelog.gz
+    dst: /usr/share/doc/porchcam/changelog.gz
+    file_info: { mode: 0644 }
+
+scripts:
+  postinstall: ./packaging/scripts/postinst
+  preremove: ./packaging/scripts/prerm
+  postremove: ./packaging/scripts/postrm

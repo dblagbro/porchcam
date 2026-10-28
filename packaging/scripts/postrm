@@ -1,0 +1,19 @@
+#!/bin/sh
+# porchcam postrm — reload systemd on remove; clean generated state on purge.
+set -e
+
+case "$1" in
+  purge)
+    rm -rf /opt/mediamtx
+    rm -f /etc/porchcam/rtsp-password
+    rmdir /etc/porchcam 2>/dev/null || true
+    rm -rf /usr/share/porchcam
+    userdel mediamtx 2>/dev/null || true
+    userdel porchcam 2>/dev/null || true
+    [ -d /run/systemd/system ] && systemctl daemon-reload 2>/dev/null || true
+    ;;
+  remove)
+    [ -d /run/systemd/system ] && systemctl daemon-reload 2>/dev/null || true
+    ;;
+esac
+exit 0

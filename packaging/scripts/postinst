@@ -1,0 +1,68 @@
+#!/bin/sh
+# porchcam postinst — mirrors install.sh for a packaged install.
+set -e
+
+MEDIAMTX_VERSION=v1.21.0
+LAN_CIDR="${PORCHCAM_LAN_CIDR:-192.168.1.0/24}"
+PASSWORD_FILE=/etc/porchcam/rtsp-password
+
+case "$1" in
+  configure)
+    # --- service accounts ---
+    id mediamtx >/dev/null 2>&1 || \
+      useradd --system --no-create-home --shell /usr/sbin/nologin mediamtx || true
+    id porchcam >/dev/null 2>&1 || \
+      useradd --system --no-create-home --shell /usr/sbin/nologin -G video porchcam || true
+
+    # --- RTSP reader password (generated once; kept across upgrades) ---
+    if [ ! -s "$PASSWORD_FILE" ]; then
+        umask 077
+        tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20 > "$PASSWORD_FILE" || true
+    fi
+    chgrp porchcam "$PASSWORD_FILE" 2>/dev/null || true
+    chmod 0640 "$PASSWORD_FILE" 2>/dev/null || true
+
+    # --- mediamtx binary (fetched; too large/arch-specific to vendor) ---
+    if [ ! -x /opt/mediamtx/mediamtx ]; then
+        mkdir -p /opt/mediamtx
+        tmp="$(mktemp -d)"
+        if curl -fsSL \
+          "https://github.com/bluenviron/mediamtx/releases/download/${MEDIAMTX_VERSION}/mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz" \
+          -o "$tmp/m.tgz" 2>/dev/null; then
+            tar xzf "$tmp/m.tgz" -C "$tmp" 2>/dev/null || true
+            [ -f "$tmp/mediamtx" ] && install -m 0755 "$tmp/mediamtx" /opt/mediamtx/mediamtx
+        fi
+        rm -rf "$tmp"
+        [ -x /opt/mediamtx/mediamtx ] || \
+          echo "porchcam: WARNING: could not fetch mediamtx; place a binary at /opt/mediamtx/mediamtx" >&2
+    fi
+
+    # --- render mediamtx.yml from the template (once) ---
+    if [ ! -e /opt/mediamtx/mediamtx.yml ] && [ -s "$PASSWORD_FILE" ]; then
+        PASS="$(cat "$PASSWORD_FILE")"
+        sed -e "s|@@RTSP_PASSWORD@@|${PASS}|" -e "s|@@LAN_CIDR@@|${LAN_CIDR}|g" \
+            /usr/share/porchcam/mediamtx.yml.template > /opt/mediamtx/mediamtx.yml 2>/dev/null || true
+        chown root:mediamtx /opt/mediamtx/mediamtx.yml 2>/dev/null || true
+        chmod 0640 /opt/mediamtx/mediamtx.yml 2>/dev/null || true
+    fi
+
+    # --- virtual camera module (needs v4l2loopback-dkms; best effort) ---
+    modprobe v4l2loopback 2>/dev/null || true
+
+    # --- systemd: enable the RTSP server; leave capture for the user to start
+    #     once they have configured their own cameras ---
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        systemctl enable --now mediamtx.service 2>/dev/null || true
+    fi
+
+    echo "porchcam: installed. Stream access is limited to ${LAN_CIDR} — set"
+    echo "  PORCHCAM_LAN_CIDR and re-render /opt/mediamtx/mediamtx.yml if that is not your LAN."
+    echo "porchcam: next steps —"
+    echo "  1. edit /etc/porchcam/porchcam.yaml for your cameras"
+    echo "  2. sudo porchcam-config render        # writes /etc/porchcam/*.env"
+    echo "  3. sudo systemctl enable --now porchcam-capture deskcam-capture"
+    echo "  health: porchcam-status   |   RTSP password: sudo cat $PASSWORD_FILE"
+    ;;
+esac
+exit 0

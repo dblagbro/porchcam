@@ -1,0 +1,15 @@
+#!/bin/sh
+# porchcam prerm — stop and disable the units before files are removed.
+set -e
+
+case "$1" in
+  remove|deconfigure)
+    if [ -d /run/systemd/system ]; then
+      for u in camera-encode-reset.timer camera-corruption-monitor.service \
+               porchcam-capture.service deskcam-capture.service mediamtx.service; do
+        systemctl disable --now "$u" 2>/dev/null || true
+      done
+    fi
+    ;;
+esac
+exit 0

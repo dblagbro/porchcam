@@ -1,0 +1,9 @@
+porchcam (0.1.0) unstable; urgency=medium
+
+  * Initial package: publishes USB/IP cameras over RTSP via mediamtx with
+    optional VAAPI re-encode; desktop overlays with a live Adjust panel
+    (brightness/contrast/colour/hue + noise filter); v4l2loopback virtual
+    camera for video calls; porchcam-config declarative configuration; and
+    optional self-healing units (corruption monitor, nightly encoder reset).
+
+ -- dblagbro <noreply@users.noreply.github.com>  Wed, 28 Oct 2026 00:00:00 +0000
