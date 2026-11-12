@@ -1,0 +1,94 @@
+#!/bin/bash
+# porchcam-autolevel — periodic adaptive exposure trim for the porch C920.
+#
+# The C920's own auto-exposure handles fast light changes, but a fixed brightness
+# bias (plus backlight compensation) blows the covered porch out to milky white
+# whenever the yard behind it is bright — and recovers when the light drops, so it
+# "comes and goes" through the day. This samples the LIVE stream on a 30-minute
+# timer, measures the average luma for the CURRENT light level, and nudges the
+# camera's `brightness` control toward a target so the picture stays correctly
+# exposed across the whole day/night cycle.
+#
+# Closed loop on ONE control (brightness); the camera's own AE does the rest.
+# backlight_compensation is forced OFF every run — it is what caused the whiteout.
+# Runs as root from porchcam-autolevel.timer. Reads the stream at 127.0.0.1 (the
+# mediamtx localhost reader needs no auth, same as camera-corruption-monitor).
+set -uo pipefail
+
+CONF=/etc/porchcam/capture.env
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+
+RTSP=${AUTOLEVEL_RTSP:-rtsp://127.0.0.1:8554/porch}
+TARGET=${AUTOLEVEL_TARGET:-0.47}      # desired average luma (0=black .. 1=white)
+DEADBAND=${AUTOLEVEL_DEADBAND:-0.05}  # leave brightness alone while |error| < this
+COEF=${AUTOLEVEL_COEF:-160}           # brightness units applied per 1.0 of luma error
+STEP_MAX=${AUTOLEVEL_STEP_MAX:-32}    # cap the change per run (ride out a transient)
+BMIN=${AUTOLEVEL_BMIN:-96}            # never drive brightness outside this band
+BMAX=${AUTOLEVEL_BMAX:-208}
+SAMPLES=${AUTOLEVEL_SAMPLES:-3}       # frames averaged per measurement
+
+TMP=$(mktemp -d /tmp/porchcam-autolevel.XXXXXX)
+trap 'rm -rf "$TMP"' EXIT
+log(){ printf '%s porchcam-autolevel: %s\n' "$(date -Is)" "$*"; }
+
+# --- resolve the porch device (same approach as porchcam-capture) -----------
+resolve_device(){
+  [[ -n ${DEVICE:-} && -e ${DEVICE:-} ]] && { echo "$DEVICE"; return 0; }
+  [[ -z ${USB_ID:-} ]] && return 1
+  local v vid pid
+  for v in /dev/video*; do
+    [[ -e $v ]] || continue
+    vid=$(udevadm info "$v" 2>/dev/null | sed -n 's/^E: ID_VENDOR_ID=//p')
+    pid=$(udevadm info "$v" 2>/dev/null | sed -n 's/^E: ID_MODEL_ID=//p')
+    [[ "$vid:$pid" == "${USB_ID}" ]] && { echo "$v"; return 0; }
+  done
+  return 1
+}
+DEV=$(resolve_device) || { log "porch device not found — skipping"; exit 0; }
+
+# --- measure current average luma (mean of SAMPLES frames) ------------------
+sum=0; n=0
+for i in $(seq 1 "$SAMPLES"); do
+  f="$TMP/f$i.png"
+  timeout 15 ffmpeg -nostdin -loglevel error -rtsp_transport tcp -i "$RTSP" \
+      -frames:v 1 -update 1 -y "$f" 2>/dev/null || continue
+  m=$(convert "$f" -colorspace Gray -format '%[fx:mean]' info: 2>/dev/null) || continue
+  [[ -n $m ]] || continue
+  sum=$(awk -v s="$sum" -v m="$m" 'BEGIN{printf "%.6f", s+m}')
+  n=$((n+1)); sleep 1
+done
+(( n > 0 )) || { log "stream not sampleable (restart/release in progress?) — skipping this cycle"; exit 0; }
+MEAN=$(awk -v s="$sum" -v n="$n" 'BEGIN{printf "%.4f", s/n}')
+
+# --- always keep backlight compensation OFF (the whiteout driver) -----------
+v4l2-ctl -d "$DEV" --set-ctrl backlight_compensation=0 2>/dev/null
+
+CUR=$(v4l2-ctl -d "$DEV" --get-ctrl brightness 2>/dev/null | awk '{print $2}')
+[[ -n ${CUR:-} ]] || { log "could not read brightness — skipping"; exit 0; }
+
+# --- proportional trim of brightness toward TARGET --------------------------
+read -r NEW ADJ <<EOF
+$(awk -v cur="$CUR" -v mean="$MEAN" -v t="$TARGET" -v db="$DEADBAND" \
+      -v coef="$COEF" -v smax="$STEP_MAX" -v bmin="$BMIN" -v bmax="$BMAX" 'BEGIN{
+  e=t-mean; ae=(e<0?-e:e)
+  if (ae<db){ print cur, 0; exit }
+  d=int(coef*e + (e<0?-0.5:0.5))
+  if (d>smax)  d=smax
+  if (d<-smax) d=-smax
+  nb=cur+d
+  if (nb<bmin) nb=bmin
+  if (nb>bmax) nb=bmax
+  print nb, nb-cur
+}')
+EOF
+
+if [[ "${ADJ:-0}" == "0" || "$NEW" == "$CUR" ]]; then
+  log "mean=${MEAN} target=${TARGET} brightness=${CUR} backlight_comp=0 — within deadband, no change"
+  exit 0
+fi
+if v4l2-ctl -d "$DEV" --set-ctrl brightness="$NEW" 2>/dev/null; then
+  log "mean=${MEAN} target=${TARGET} brightness ${CUR}->${NEW} (${ADJ}) backlight_comp=0 dev=${DEV}"
+else
+  log "WARN: failed to set brightness=${NEW} on ${DEV}"
+fi

@@ -613,10 +613,17 @@ class Overlay:
     def run(self):
         self.window.show_all()
         self.apply_opacity()
-        # Mutter re-places undecorated windows at map time, overriding the move()
-        # made before show(), so the saved position is re-applied once the window
-        # is actually on screen.
+        # Mutter re-places undecorated windows asynchronously at map time,
+        # overriding the move() made before show().  A SINGLE re-move races that
+        # placement and loses intermittently — notably when the overlay is
+        # reopened "cold" (e.g. an auto-reclaim after the window has been gone a
+        # while), when the WM no longer remembers the last position and applies
+        # its own default instead (landing it on the wrong monitor).  Re-assert
+        # the saved position a few times across the first ~1.2s so it reliably
+        # wins the race, then stop (so the user can still drag it freely after).
         GLib.idle_add(self._restore_position)
+        for _delay_ms in (50, 200, 600, 1200):
+            GLib.timeout_add(_delay_ms, self._restore_position)
         self.start_stream()
         Gtk.main()
 
